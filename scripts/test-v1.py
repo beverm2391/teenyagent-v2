@@ -4,5 +4,4 @@ toolbox = Toolbox()
 code_model = CodeModel()
 
 agent = Agent(code_model, toolbox)
-result = agent.run("What is the capital of France?")
-print(result)
+result = agent.run("Who is Ben Everman?")
