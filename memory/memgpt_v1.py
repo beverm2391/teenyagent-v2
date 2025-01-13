@@ -73,23 +73,37 @@ class ObserverResponse(BaseModel):
 # ! MemGPT
 class MemGPT:
     def __init__(self, context_window=200000, debug=DebugLevel.DEBUG):
-        self.chat_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+        # ! Models
         self.chat_model = "claude-3-5-sonnet-latest"
-        self.relevance_client = Cohere(api_key=COHERE_API_KEY)
-        self.relevance_model = "rerank-v3.5"
-        self.observer_client = OpenAI(api_key=OPENAI_API_KEY)
         self.observer_model = "gpt-4o"
+        self.relevance_model = "rerank-v3.5"
+
+        # ! Clients
+        self.chat_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+        self.relevance_client = Cohere(api_key=COHERE_API_KEY)
+        self.observer_client = OpenAI(api_key=OPENAI_API_KEY)
+
+        # ! Tokenizer
         self.tokenizer = tiktoken.get_encoding("cl100k_base")
+
+        # ! Context Window
         self.context_window = context_window
         self.max_response_tokens = 4096
+
+        # ! Memories
         self.working_memory: Dict[str, float] = {}
         self.conversation = deque(maxlen=20)
         self.archive: List[Tuple[str, float]] = []
-        self.pressure_threshold = 0.8
-        self.working_memory_threshold = 0.7
-        self.archive_threshold = 0.3
+
+        # ! Thresholds
+        self.pressure_threshold = 0.8 # 80% of the context window
+        self.working_memory_threshold = 0.65
+        self.archive_threshold = 0.2
+
+        # ! Debug
         self.debug = debug
 
+        # Log everything we did
         updates = []
         updates.append("MemGPT initialized")
         updates.append(f"Chat Model: {self.chat_model}")
@@ -152,13 +166,15 @@ class MemGPT:
         print("querying llm")
         response = self._query_llm(prompt)
 
+        # updaet the conversation so that when we call _update_memories, we have the most recent messages
         self.conversation.append({"role": "user", "content": user_input})
         self.conversation.append({"role": "assistant", "content": response})
 
+        # TODO make this async somehow??
         print("extracting facts from the response")
         new_facts = self._extract_facts(user_input, response)
         print("updating memories")
-        self._update_memories(user_input, new_facts)
+        self._update_memories(new_facts)
         print("logging assistant response")
         self._rich_basic(response, "Assistant Response")
         return response
