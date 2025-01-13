@@ -45,3 +45,5 @@ data
 *.swo
 
 .DS_Store
+
+notebooks
