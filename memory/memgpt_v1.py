@@ -70,6 +70,21 @@ class ObserverResponse(BaseModel):
         description="A list of strings that are the facts that the observer extracted from the conversation."
     )
 
+
+extraction_system_prompt = """
+    You are an expert at extracting important information from conversations.
+    You are given a conversation between a user and an assistant.
+    You are tasked with extracting important information from the conversation that the assistant doesn't already know.
+    You prioritize technical knowledge like how something was implemented, code, or other technical details.
+    You always return a Python list of "blurbs" of the information you extracted. It is important that you include all important information in each blurb, so that someone can refer back to them later without the original conversation and understand the context. Make sure your blurbs are descriptive of all core information but not verbose in style.
+"""
+
+extraction_user_prompt = """
+    Extract important information from this conversation that you don't already know.
+    User: {user_input}\nAssistant: {response}
+"""
+
+
 # ! MemGPT
 class MemGPT:
     def __init__(self, context_window=200000, debug=DebugLevel.DEBUG):
@@ -88,18 +103,24 @@ class MemGPT:
 
         # ! Context Window
         self.context_window = context_window
-        self.max_response_tokens = 4096
+        self.max_response_tokens = 8192
 
         # ! Memories
         self.working_memory: Dict[str, float] = {}
-        self.conversation = deque(maxlen=20)
+        self.conversation: deque = deque()
         self.archive: List[Tuple[str, float]] = []
         self.current_task: str = ""
 
-        # ! Thresholds
-        self.pressure_threshold = 0.8 # 80% of the context window
-        self.working_memory_threshold = 0.65
-        self.archive_threshold = 0.2
+        # ! Thresholds and sizes
+        buffer = 1000 # general buffer for tokens
+        # max input tokens is the context window minus the max response tokens and buffer
+        self.max_input_tokens = self.context_window - self.max_response_tokens - buffer
+        self.conversation_size = 0.6 * self.max_input_tokens # 60% of the max input tokens
+        self.working_memory_size = (1-(self.conversation_size / self.max_input_tokens)) * self.context_window # the rest of the max input tokens
+
+        # Relevance thresholds (when should we add a fact to working memory or archive)
+        self.working_memory_relevance_threshold = 0.5
+        self.archive_relevance_threshold = 0.15
 
         # ! Debug
         self.debug = debug
@@ -113,9 +134,9 @@ class MemGPT:
         updates.append(f"Relevance Model: {self.relevance_model}")
         updates.append(f"Context Window: {self.context_window} tokens")
         updates.append(f"Max Response Tokens: {self.max_response_tokens} tokens")
-        updates.append(f"Working Memory Threshold: {self.working_memory_threshold}")
-        updates.append(f"Archive Threshold: {self.archive_threshold}")
-        updates.append(f"Pressure Threshold: {self.pressure_threshold}")
+        updates.append(f"Working Memory Relevance Threshold: {self.working_memory_relevance_threshold}")
+        updates.append(f"Archive Relevance Threshold: {self.archive_relevance_threshold}")
+        updates.append(f"Memory Pressure Threshold: {self.memory_pressure_threshold}")
         self._rich_block("\n".join(updates), "Initialization", "green")
 
     def _rich_block(
@@ -135,7 +156,7 @@ class MemGPT:
                     width=100,
                 )
             )
-    
+
     def _rich_log(
         self,
         content: str,
@@ -145,7 +166,6 @@ class MemGPT:
         if self.debug.value >= level.value:
             self.console.log(f"[{style}]{content}[/{style}]")
 
-
     async def chat(self, user_input: str) -> str:
         """
         Main user interaction. Checks memory size, possibly handles pressure,
@@ -153,17 +173,12 @@ class MemGPT:
         """
         self._rich_block(f"{user_input[:500]}...", "User Input")
 
-        current_size = self._get_current_context_size()
-        if current_size > self.pressure_threshold * self.context_window:
+        if self.over_max_input_tokens:
             self.console.log("Triggering memory pressure", "yellow")
-            self._rich_block(
-                f"Memory pressure: {current_size}/{self.context_window} tokens",
-                "Memory Warning",
-                "red",
-                DebugLevel.ERRORS,
-            )
-            self._handle_memory_pressure()
+            self._show_memory_status() # show the memory status
+            self._handle_memory_pressure() # handle the memory pressure
 
+        # Enter the main loop
         self.console.log("Getting relevant memories")
         relevant_context = self._get_relevant_memories(user_input)
         if len(relevant_context) > 0:
@@ -197,11 +212,83 @@ class MemGPT:
         self._rich_block(response, "Assistant Response")
         return response
     
+    @property
+    def over_max_input_tokens(self) -> bool:
+        """
+        Returns true if the current context size is over the max input tokens
+        """
+        return (self.working_memory_tokens + self.conversation_tokens) > self.max_input_tokens
+
+    @property
+    def conversation_tokens(self) -> int:
+        """
+        Updates the conversation tokens based on the messages.
+        """
+        # if no messages yet, return 0
+        if len(self.conversation) == 0:
+            return 0
+        
+        # else, count it
+        dump_conversation = "\n".join(f"{m['role']}: {m['content']}" for m in self.conversation)
+        return sum(len(self.tokenizer.encode(dump_conversation)))
+
+    @property
+    def working_memory_tokens(self) -> int:
+        """
+        Returns the total amount of tokens in the working memory.
+        """
+        # if no working memory yet, return 0
+        if len(self.working_memory) == 0:
+            return 0
+
+        # else, count it
+        mem_str = "\n".join(f"{k}: {v}" for k, v in self.working_memory.items())
+        return sum(len(self.tokenizer.encode(mem_str)))
+
+    # TODO make a conversation class with methods on it
+    def _trim_conversation(self, chunk_size: int = 1000, depth: int = 0):
+        """
+        Trims the conversation to the given number of tokens in chunks of chunk_size.
+        """
+        if self.conversation_size > self.conversation_tokens:
+            if depth > 0: # if we trimmed anything, log it
+                print(f"Trimmed conversation to {self.conversation_tokens} tokens")
+            else: # if we didn't trim anything, log that
+                print("No need to trim conversation")
+            return
+        else:
+            # trim by chunk_size
+            oldest_message = self.conversation.popleft()
+            oldest_message_tokens = len(self.tokenizer.encode(oldest_message["content"]))
+            if oldest_message_tokens > chunk_size:
+                oldest_message["content"] = self.tokenizer.decode(self.tokenizer.encode(oldest_message["content"])[:chunk_size])
+            return self._trim_conversation(chunk_size, depth + 1)
+
+    # TODO make a working memory class with methods on it
+    def _trim_working_memory(self, chunk_size: int = 1000, depth: int = 0):
+        """
+        Trims the working memory to the given number of tokens in chunks of chunk_size.
+        """
+        if self.working_memory_size > self.working_memory_tokens:
+            if depth > 0: # if we trimmed anything, log it
+                print(f"Trimmed working memory to {self.working_memory_tokens} tokens")
+            else: # if we didn't trim anything, log that
+                print("No need to trim working memory")
+            return
+        else:
+            least_relevant_fact = min(self.working_memory.items(), key=lambda x: x[1])
+            # move the least relevant fact to the archive
+            self.archive.append(least_relevant_fact)
+            del self.working_memory[least_relevant_fact[0]]
+            return self._trim_working_memory(chunk_size, depth + 1)
+
     async def _update_current_task(self):
         """
         Get the current task from the conversation.
         """
-        dump_conversation = "\n".join(f"{m['role']}: {m['content']}" for m in self.conversation)
+        dump_conversation = "\n".join(
+            f"{m['role']}: {m['content']}" for m in self.conversation
+        )
         prompt = f"Figure out the current task from the conversation. Return a concise task description. CONVERSATION: {dump_conversation}"
         response = await self.observer_client.chat.completions.create(
             model=self.observer_model,
@@ -226,15 +313,6 @@ class MemGPT:
         )
         return f"{facts_text}\n\n{archive_text}\n\n{recent_chat}\n\nUser: {user_input}"
 
-    def _get_current_context_size(self) -> int:
-        """
-        Simple token counting of working memory plus conversation.
-        """
-        mem_str = "\n".join(f"{k}: {v}" for k, v in self.working_memory.items())
-        conv_str = "\n".join(f"{m['role']}: {m['content']}" for m in self.conversation)
-        return len(self.tokenizer.encode(mem_str)) + len(
-            self.tokenizer.encode(conv_str)
-        )
 
     def _query_llm(self, prompt: str) -> str:
         """
@@ -255,16 +333,22 @@ class MemGPT:
         """
         Uses the model to extract new facts. If it fails, returns empty.
         """
-        extraction_prompt = (
-            "Extract important facts from this conversation that you don't already know."
-            "Return a Python list of short strings. "
-            f"User: {user_input}\nAssistant: {response}"
-        )
         try:
             # call the parse method
             extraction = await self.observer_client.beta.chat.completions.parse(
                 model=self.observer_model,
-                messages=[{"role": "user", "content": extraction_prompt}],
+                messages=[
+                    {
+                        "role": "system",
+                        "content": extraction_system_prompt,
+                    },
+                    {
+                        "role": "user",
+                        "content": extraction_user_prompt.format(
+                            user_input=user_input, response=response
+                        ),
+                    },
+                ],
                 max_tokens=1000,
                 response_format=ObserverResponse,
             )
@@ -278,7 +362,9 @@ class MemGPT:
             )
             return facts
         except Exception as e:
-            self._rich_block(f"Fact extraction failed: {e}", "Error", "red", DebugLevel.ERRORS)
+            self._rich_block(
+                f"Fact extraction failed: {e}", "Error", "red", DebugLevel.ERRORS
+            )
             return []
 
     def _update_memories(self, facts: List[str]):
@@ -289,56 +375,74 @@ class MemGPT:
         if not facts:
             print("in _update_memories, no facts to update")
             return
-        
+
         scored = self._rerank_documents(self.current_task, facts)
         updates = []
         self.console.log("scored facts: ", scored)
         for fact, score in scored:
-            if score > self.working_memory_threshold:
-                self.console.log("adding to working memory: ", fact, "with score: ", score)
+            if score > self.working_memory_relevance_threshold:
+                self.console.log(
+                    "adding to working memory: ", fact, "with score: ", score
+                )
                 self.working_memory[fact] = score
                 updates.append(f"Working Memory: {fact} ({score:.2f})")
-            elif score > self.archive_threshold:
+            elif score > self.archive_relevance_threshold:
                 self.console.log("adding to archive: ", fact, "with score: ", score)
                 self.archive.append((fact, score))
                 updates.append(f"Archive: {fact} ({score:.2f})")
             else:
-                self.console.log("discarding fact: ", fact, "due to low score of: ", score)
+                self.console.log(
+                    "discarding fact: ", fact, "due to low score of: ", score
+                )
 
         if updates:
             self._rich_block("\n".join(updates), "Memory Updates", "green")
 
+
     def _handle_memory_pressure(self):
         """
-        Moves less important items from working memory to archive.
+        This does a few things:
+        - Trims the conversation to the conversation size set in the constructor
+        - Moves less important items from working memory to archive
+        - Then, if still needed, trims the working memory to the working memory size set in the constructor
         """
-        if not self.working_memory:
-            self.console.log("in _handle_memory_pressure, no working memory to handle")
-            return
-        
-        dump_conversation = "\n".join(f"{m['role']}: {m['content']}" for m in self.conversation)
+        # We need to check two things, the conversation size and the working memory size
 
-        self._rich_block("Handling memory pressure...", "Memory Management", "green")
-        scored = self._rerank_documents(
-            self.current_task, list(self.working_memory.keys())
-        )
+        # If our conversation is too big, trim it with our _trim_conversation method
+        if self.conversation_tokens > self.conversation_size:
+            self._trim_conversation()
 
-        moved = []
-        for fact, score in scored:
-            if score < self.working_memory_threshold:
-                self.archive.append((fact, score))
-                del self.working_memory[fact]
-                moved.append(f"Moved to archive: {fact} ({score:.2f})")
+        # If our working memory is too big, handle it by reranking and moving less important items to archive
+        if self.conversation_tokens > self.working_memory_size:
 
-        if moved:
-            self._rich_block("\n".join(moved), "Memory Pressure Resolution", "green")
+            # First we rerank the working memory to see what is important
+            # Since we only want to trim the least important items to the current tasks
+            # TODO figure out if it'll alrady be ranked and this is redundant (aka update_memory was just called)
+            self._rich_block("Handling memory pressure...", "Memory Management", "green")
+            scored = self._rerank_documents(
+                self.current_task, list(self.working_memory.keys())
+            )
+            moved = []
+            for fact, score in scored:
+                if score < self.working_memory_relevance_threshold:
+                    self.archive.append((fact, score))
+                    del self.working_memory[fact]
+                    moved.append(f"Moved to archive: {fact} ({score:.2f})")
+
+            # Now we trim the working memory to the size we want, if its over
+            self._trim_working_memory()
+
+            if moved:
+                self._rich_block("\n".join(moved), "Memory Pressure Resolution", "green")
 
     def _get_relevant_memories(self, query: str) -> List[Tuple[str, float]]:
         """
         Reranks the archive for relevance to the query.
         """
         if not self.archive:
-            self.console.log("in _get_relevant_memories, no archive to get relevant memories from. returning empty list")
+            self.console.log(
+                "in _get_relevant_memories, no archive to get relevant memories from. returning empty list"
+            )
             return []
         docs = [mem[0] for mem in self.archive]
         return self._rerank_documents(query, docs)
@@ -355,39 +459,23 @@ class MemGPT:
             )
             return [(documents[r.index], r.relevance_score) for r in result.results]
         except Exception as e:
-            self._rich_block(f"Reranking failed: {e}", "Error", "red", DebugLevel.ERRORS)
+            self._rich_block(
+                f"Reranking failed: {e}", "Error", "red", DebugLevel.ERRORS
+            )
             return [(doc, 0.5) for doc in documents]
 
-    def show_memory_status(self):
+    def _show_memory_status(self):
         """
-        Shows how close we are to hitting memory pressure.
-        This prints basic info on the context window, working memory usage, conversation usage, and thresholds.
+        Shows memory status
         """
-        # Builds a string of working memory items so we can tokenize it to measure how many tokens they occupy
-        mem_str = "\n".join(k for k in self.working_memory.keys())
-        # Builds a string of conversation items for token counting
-        conv_str = "\n".join(f"{m['role']}: {m['content']}" for m in self.conversation)
-
-        # Measures token usage for working memory
-        working_memory_tokens = len(self.tokenizer.encode(mem_str))
-        # Measures token usage for conversation
-        conversation_tokens = len(self.tokenizer.encode(conv_str))
-        # Calculates the total used tokens
-        total_used_tokens = working_memory_tokens + conversation_tokens
-        # Calculates how many tokens remain before we exceed our context window
-        tokens_remaining = self.context_window - total_used_tokens
-        # Calculates the overall pressure ratio
-        overall_pressure = total_used_tokens / self.context_window
-
-        # Constructs a message to display in a Rich panel
         status_message = (
             f"Total context window: {self.context_window}\n"
-            f"Working memory tokens: {working_memory_tokens}\n"
-            f"Conversation tokens: {conversation_tokens}\n"
-            f"Tokens remaining: {tokens_remaining}\n"
-            f"Overall pressure: {overall_pressure:.2f}\n"
-            f"Pressure threshold: {self.pressure_threshold}"
+            f"Max Input Tokens: {self.max_input_tokens}\n"
+            f"Working memory tokens: {self.working_memory_tokens} / {self.working_memory_size}\n"
+            f"Conversation tokens: {self.conversation_tokens} / {self.conversation_size}\n"
         )
 
         # Uses the existing log mechanism to display the information
-        self._rich_block(status_message, "Memory Status", "cyan", level=DebugLevel.BASIC)
+        self._rich_block(
+            status_message, "Memory Status", "cyan", level=DebugLevel.BASIC
+        )
