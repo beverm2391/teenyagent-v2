@@ -20,7 +20,8 @@ from rich.console import Console
 from dotenv import load_dotenv
 from enum import Enum
 from pydantic import Field
-from openai import OpenAI
+from openai import AsyncOpenAI
+import asyncio
 
 
 # ! Env Vars
@@ -69,7 +70,6 @@ class ObserverResponse(BaseModel):
         description="A list of strings that are the facts that the observer extracted from the conversation."
     )
 
-
 # ! MemGPT
 class MemGPT:
     def __init__(self, context_window=200000, debug=DebugLevel.DEBUG):
@@ -81,7 +81,7 @@ class MemGPT:
         # ! Clients
         self.chat_client = Anthropic(api_key=ANTHROPIC_API_KEY)
         self.relevance_client = Cohere(api_key=COHERE_API_KEY)
-        self.observer_client = OpenAI(api_key=OPENAI_API_KEY)
+        self.observer_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
         # ! Tokenizer
         self.tokenizer = tiktoken.get_encoding("cl100k_base")
@@ -94,6 +94,7 @@ class MemGPT:
         self.working_memory: Dict[str, float] = {}
         self.conversation = deque(maxlen=20)
         self.archive: List[Tuple[str, float]] = []
+        self.current_task: str = ""
 
         # ! Thresholds
         self.pressure_threshold = 0.8 # 80% of the context window
@@ -102,6 +103,7 @@ class MemGPT:
 
         # ! Debug
         self.debug = debug
+        self.console = console
 
         # Log everything we did
         updates = []
@@ -114,9 +116,9 @@ class MemGPT:
         updates.append(f"Working Memory Threshold: {self.working_memory_threshold}")
         updates.append(f"Archive Threshold: {self.archive_threshold}")
         updates.append(f"Pressure Threshold: {self.pressure_threshold}")
-        self._rich_basic("\n".join(updates), "Initialization", "green")
+        self._rich_block("\n".join(updates), "Initialization", "green")
 
-    def _rich_basic(
+    def _rich_block(
         self,
         content: str,
         title: str,
@@ -124,7 +126,7 @@ class MemGPT:
         level: DebugLevel = DebugLevel.BASIC,
     ):
         if self.debug.value >= level.value:
-            console.print(
+            self.console.print(
                 Panel(
                     str(content),
                     title=f"[{style}]{title}[/{style}]",
@@ -133,18 +135,28 @@ class MemGPT:
                     width=100,
                 )
             )
+    
+    def _rich_log(
+        self,
+        content: str,
+        style: str = "white",
+        level: DebugLevel = DebugLevel.BASIC,
+    ):
+        if self.debug.value >= level.value:
+            self.console.log(f"[{style}]{content}[/{style}]")
 
-    def chat(self, user_input: str) -> str:
+
+    async def chat(self, user_input: str) -> str:
         """
         Main user interaction. Checks memory size, possibly handles pressure,
         retrieves context, constructs prompt, calls model, updates memories.
         """
-        self._rich_basic(f"{user_input[:500]}...", "User Input")
+        self._rich_block(f"{user_input[:500]}...", "User Input")
 
         current_size = self._get_current_context_size()
         if current_size > self.pressure_threshold * self.context_window:
-            print("Triggering memory pressure")
-            self._rich_basic(
+            self.console.log("Triggering memory pressure", "yellow")
+            self._rich_block(
                 f"Memory pressure: {current_size}/{self.context_window} tokens",
                 "Memory Warning",
                 "red",
@@ -152,18 +164,18 @@ class MemGPT:
             )
             self._handle_memory_pressure()
 
-        print("getting relevant memories")
+        self.console.log("Getting relevant memories")
         relevant_context = self._get_relevant_memories(user_input)
         if len(relevant_context) > 0:
-            self._rich_basic(
+            self._rich_block(
                 "\n".join(f"- {mem[0]} ({mem[1]:.2f})" for mem in relevant_context),
                 "Retrieved Memories",
                 "green",
             )
 
-        print("building prompt")
+        self.console.log("Building prompt")
         prompt = self._build_prompt(relevant_context, user_input)
-        print("querying llm")
+        self.console.log("Querying LLM")
         response = self._query_llm(prompt)
 
         # updaet the conversation so that when we call _update_memories, we have the most recent messages
@@ -171,13 +183,35 @@ class MemGPT:
         self.conversation.append({"role": "assistant", "content": response})
 
         # TODO make this async somehow??
-        print("extracting facts from the response")
-        new_facts = self._extract_facts(user_input, response)
-        print("updating memories")
+        self.console.log("Extracting facts from response")
+
+        # get new facts from the output
+        new_facts = await self._extract_facts(user_input, response)
+
+        # update the current task based on the new messages
+        await self._update_current_task()
+
+        self.console.log("Updating memories")
         self._update_memories(new_facts)
-        print("logging assistant response")
-        self._rich_basic(response, "Assistant Response")
+        self.console.log("Logging assistant response")
+        self._rich_block(response, "Assistant Response")
         return response
+    
+    async def _update_current_task(self):
+        """
+        Get the current task from the conversation.
+        """
+        dump_conversation = "\n".join(f"{m['role']}: {m['content']}" for m in self.conversation)
+        prompt = f"Figure out the current task from the conversation. Return a concise task description. CONVERSATION: {dump_conversation}"
+        response = await self.observer_client.chat.completions.create(
+            model=self.observer_model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1000,
+        )
+        current_task = response.choices[0].message.content
+        self._rich_block(current_task, "Current Task", "yellow")
+        self.current_task = current_task
+        return current_task
 
     def _build_prompt(self, relevant_context, user_input):
         """
@@ -214,10 +248,10 @@ class MemGPT:
             )
             return response.content[0].text
         except Exception as e:
-            self._rich_basic(str(e), "LLM Error", "red", DebugLevel.ERRORS)
+            self._rich_block(str(e), "LLM Error", "red", DebugLevel.ERRORS)
             raise RuntimeError(f"LLM query failed: {e}")
 
-    def _extract_facts(self, user_input: str, response: str) -> List[str]:
+    async def _extract_facts(self, user_input: str, response: str) -> List[str]:
         """
         Uses the model to extract new facts. If it fails, returns empty.
         """
@@ -228,7 +262,7 @@ class MemGPT:
         )
         try:
             # call the parse method
-            extraction = self.observer_client.beta.chat.completions.parse(
+            extraction = await self.observer_client.beta.chat.completions.parse(
                 model=self.observer_model,
                 messages=[{"role": "user", "content": extraction_prompt}],
                 max_tokens=1000,
@@ -237,14 +271,14 @@ class MemGPT:
             # get the results from the parsed response model
             facts: List[str] = extraction.choices[0].message.parsed.results
             # log the facts
-            self._rich_basic(
+            self._rich_block(
                 f"Extracted facts:\n" + "\n".join(f"- {f}" for f in facts),
                 "Memory Update",
                 "green",
             )
             return facts
         except Exception as e:
-            self._rich_basic(f"Fact extraction failed: {e}", "Error", "red", DebugLevel.ERRORS)
+            self._rich_block(f"Fact extraction failed: {e}", "Error", "red", DebugLevel.ERRORS)
             return []
 
     def _update_memories(self, facts: List[str]):
@@ -256,39 +290,37 @@ class MemGPT:
             print("in _update_memories, no facts to update")
             return
         
-        dump_conversation = "\n".join(f"{m['role']}: {m['content']}" for m in self.conversation)
-        scored = self._rerank_documents(f"What is most important based on the current conversation? Apply more weight to the most recent messages. CONVERSTION:\n\n{dump_conversation}\n\nEND CONVERSTION", facts)
+        scored = self._rerank_documents(self.current_task, facts)
         updates = []
-        print("scored facts: ", scored)
+        self.console.log("scored facts: ", scored)
         for fact, score in scored:
-            print("fact: ", fact, "score: ", score)
             if score > self.working_memory_threshold:
-                print("adding to working memory")
+                self.console.log("adding to working memory: ", fact, "with score: ", score)
                 self.working_memory[fact] = score
                 updates.append(f"Working Memory: {fact} ({score:.2f})")
             elif score > self.archive_threshold:
-                print("adding to archive")
+                self.console.log("adding to archive: ", fact, "with score: ", score)
                 self.archive.append((fact, score))
                 updates.append(f"Archive: {fact} ({score:.2f})")
             else:
-                print("discarding fact due to low score of: ", score)
+                self.console.log("discarding fact: ", fact, "due to low score of: ", score)
 
         if updates:
-            self._rich_basic("\n".join(updates), "Memory Updates", "green")
+            self._rich_block("\n".join(updates), "Memory Updates", "green")
 
     def _handle_memory_pressure(self):
         """
         Moves less important items from working memory to archive.
         """
         if not self.working_memory:
-            print("in _handle_memory_pressure, no working memory to handle")
+            self.console.log("in _handle_memory_pressure, no working memory to handle")
             return
         
         dump_conversation = "\n".join(f"{m['role']}: {m['content']}" for m in self.conversation)
 
-        self._rich_basic("Handling memory pressure...", "Memory Management", "green")
+        self._rich_block("Handling memory pressure...", "Memory Management", "green")
         scored = self._rerank_documents(
-            f"Most critical to keep in working memory based on the current conversation. Apply more weight to the most recent messages. CONVERSTION:\n\n{dump_conversation}\n\nEND CONVERSTION", list(self.working_memory.keys())
+            self.current_task, list(self.working_memory.keys())
         )
 
         moved = []
@@ -299,14 +331,14 @@ class MemGPT:
                 moved.append(f"Moved to archive: {fact} ({score:.2f})")
 
         if moved:
-            self._rich_basic("\n".join(moved), "Memory Pressure Resolution", "green")
+            self._rich_block("\n".join(moved), "Memory Pressure Resolution", "green")
 
     def _get_relevant_memories(self, query: str) -> List[Tuple[str, float]]:
         """
         Reranks the archive for relevance to the query.
         """
         if not self.archive:
-            print("in _get_relevant_memories, no archive to get relevant memories from. returning empty list")
+            self.console.log("in _get_relevant_memories, no archive to get relevant memories from. returning empty list")
             return []
         docs = [mem[0] for mem in self.archive]
         return self._rerank_documents(query, docs)
@@ -323,7 +355,7 @@ class MemGPT:
             )
             return [(documents[r.index], r.relevance_score) for r in result.results]
         except Exception as e:
-            self._rich_basic(f"Reranking failed: {e}", "Error", "red", DebugLevel.ERRORS)
+            self._rich_block(f"Reranking failed: {e}", "Error", "red", DebugLevel.ERRORS)
             return [(doc, 0.5) for doc in documents]
 
     def show_memory_status(self):
@@ -358,4 +390,4 @@ class MemGPT:
         )
 
         # Uses the existing log mechanism to display the information
-        self._rich_basic(status_message, "Memory Status", "cyan", level=DebugLevel.BASIC)
+        self._rich_block(status_message, "Memory Status", "cyan", level=DebugLevel.BASIC)
